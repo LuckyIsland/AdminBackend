@@ -4,6 +4,9 @@ from flask import request
 import json
 import random
 import uuid
+from datetime import datetime
+from datetime import timedelta
+from dateutil import parser as date_parser
 
 from constants import *
 from db_helper import Session
@@ -88,6 +91,9 @@ class CheckAuthCode(Resource):
 
 class SportsWithRelations(Resource):
     def get(self):
+        if not SessionStorage.check_access(request.headers.get(SESSION_HEADER)):
+            return PERMISSIONS_DENIED
+
         sql_session = Session()
         sports = self._get_sports(sql_session)
         sports = self._update_sports_with_bet_types(sql_session, sports)
@@ -184,54 +190,208 @@ class SportsWithRelations(Resource):
 
 class Event(Resource):
     def post(self):
-        pass
-        # try:
-        #     data = request.data
-        # except:
-        #     return {'Message': 'Bad request data!', 'Status': 2}
-        # return {}
+        if not SessionStorage.check_access(request.headers.get(SESSION_HEADER)):
+            return PERMISSIONS_DENIED
 
-        # try:
-        #     data['SportId']
-        #     data['LeagueId']
-        #     data['EventDate']
-        #     data['HomeId']
-        #     data['GuestId']
-        #     data['Description']
-        #     data['CountryCode']
-        #     data['BetType']
+        data = request.data
+        try:
+            data = json.loads(data)
+            sport_id = data['SportId']
+            league_id = data['LeagueId']
+            event_date = data['EventDate']
+            home_id = data['HomeId']
+            guest_id = data['GuestId']
+            description = data.get('Description', '')
+            country_code = data['CountryCode']
+            bet_type_id = data['BetType']['BetTypeId']
+            odds = data['BetType']['Odds']
+        except:
+            return {'Message': 'Bad request data!', 'Status': 2}
 
-        #     event_code = self._generate_event_code()
-        #     event_type = 0
-        #     event_name = 'HomeTeam - GuestTeam'
-        #     period = 1
-        #     timer = 0
-        #     status = 0
-        #     created_date = now()
-        #     betting_line_template_id = 1
-        #     league_status = league(status)
-        #     end_date = calculate start + delta
-        #     team_winner_id = None
-        #     is_approved = 0
-        # except KeyError:
-        #     return {'Message': 'Bad request data!', 'Status': 2}
+        session = Session()
+        try:
+            event_code = self._generate_event_code()
+            event_name = self._get_event_name(home_id, guest_id)
+            created_date = str(datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"))
+            league_status = self._get_league_status(league_id)
+            end_date = self._get_end_date(event_date, sport_id)
+            # event_type = 0
+            # period = 1
+            # timer = 0
+            # status = 0
+            # betting_line_template_id = 1
+            # team_winner_id = None
+            # is_approved = 0
 
-    def _generate_event_code():
+            session.execute("insert into event(sportid, leagueid, eventdate, homeid, guestid, description, countrycode, bettypeid, eventcode, eventname, createddate, leaguestatus, enddate) values({sport_id}, {league_id}, '{event_date}', {home_id}, {guest_id}, '{description}', '{country_code}', {bet_type_id}, '{event_code}', '{event_name}', '{created_date}', {league_status}, '{end_date}')".format(
+                sport_id=sport_id,
+                league_id=league_id,
+                event_date=event_date,
+                home_id=home_id,
+                guest_id=guest_id,
+                description=description,
+                country_code=country_code,
+                bet_type_id=bet_type_id,
+                event_code=event_code,
+                event_name=event_name,
+                created_date=created_date,
+                league_status=league_status,
+                end_date=end_date
+            ))
+            event_id = session.execute("select top(1) id from event with(nolock) order by id desc").fetchone()[0]
+
+            for odd in odds:
+                factor = odd.get('OddFactor', None)
+                type_id = odd.get('OddId', None)
+                limit = odd.get('OddLimit', None)
+                if limit is None or type_id is None or factor is None:
+                    print 'Something is None (limit, factor, type_id)'
+                    return {'Message': 'Bad request data!', 'Status': 2}
+                session.execute("insert into eventodds(eventid, bettypeid, oddtypeid, oddfactor, limit) values({event_id}, {bet_type_id}, {type_id}, {factor}, {limit})".format(
+                    event_id=event_id,
+                    bet_type_id=bet_type_id,
+                    type_id=type_id,
+                    factor=factor,
+                    limit=limit
+                ))
+
+            session.commit()
+            return {'Message': 'Success!', 'Status': 0}
+        except Exception as e:
+            session.rollback()
+            print e
+            return {'Message': 'Bad request data!', 'Status': 2}
+        finally:
+            session.close()
+
+
+    def _generate_event_code(self):
         return str(random.randint(1000, 9999))
 
-
-
-
-class SportByTree(Resource):
-    def get(self):
+    def _get_end_date(self, start_date, sport_id):
         session = Session()
-        session.connection()
-        query = session.execute("exec webAPI_Client_GetSportsTree")
-        headers = query.keys()
-        sports_tree = query.fetchall()
+        dur = session.execute("select top(1) matchduration from sport with(nolock) where id = {sport_id}".format(sport_id=sport_id)).fetchone()[0]
+        dur = timedelta(minutes=int(dur))
+        start_date = date_parser.parse(start_date)
+        end_date = str(start_date + dur)
+        session.close()
+        return end_date
 
-        result = {'headers': list(headers), 'data': []}
-        for sport in sports_tree:
-            result['data'] += list(sport)
+    def _get_league_status(self, league_id):
+        session = Session()
+        status = session.execute("select top(1) status from league with(nolock) where id = {league_id}".format(league_id=league_id)).fetchone()[0]
+        return int(status)
 
-        return result, status.HTTP_200_OK
+    def _get_event_name(self, home_id, guest_id):
+        session = Session()
+        home = session.execute("select top(1) name from team with(nolock) where id = {home_id}".format(home_id=home_id)).fetchone()[0]
+        guest = session.execute("select top(1) name from team with(nolock) where id = {guest_id}".format(guest_id=guest_id)).fetchone()[0]
+        return "{home} - {guest}".format(home=home, guest=guest)
+
+
+class AgentTree(Resource):
+    def get(self):
+        if not SessionStorage.check_access(request.headers.get(SESSION_HEADER)):
+            return PERMISSIONS_DENIED
+
+        session = Session()
+        agents = session.execute("select id, firstname, lastname, parrentid from account where accountrole = 'Agent'").fetchall()
+
+        auth_user_role = SessionStorage.get_account_role(request.headers.get(SESSION_HEADER))
+        resp = []
+        if auth_user_role == AGENT:
+            resp = self._generate_agents_tree(agents, SessionStorage.get_user_id(request.headers.get(SESSION_HEADER)))
+        elif auth_user_role == ADMIN:
+            resp = self._generate_agents_tree(agents)
+
+        return {'Message': 'OK!', 'Status': 0, 'Results': resp}
+
+    def _generate_agents_tree(self, agents, start_agent=None):
+        old_count = 0
+        count = 0
+
+        res = []
+        cur = {}
+        for agent in agents:
+            if (agent[3] is None and start_agent is None) or (start_agent is not None and agent[0] == start_agent):
+                tmp = {
+                    "Name": agent[1] + ' ' + agent[2],
+                    "Id": int(agent[0]),
+                    "Agents" : []
+                    }
+                cur[agent[0]] = tmp['Agents']
+                res.append(tmp)
+                count += 1
+
+        while count != old_count:
+            old_count = count
+            new_cur = {}
+            for agent in agents:
+                tmp = cur.get(agent[3], None)
+                if tmp is not None:
+                    t = {
+                    "Name": agent[1] + ' ' + agent[2],
+                    "Id": int(agent[0]),
+                    "Agents" : []
+                    }
+                    new_cur[agent[0]] = t['Agents']
+                    tmp.append(t)
+                    count += 1
+            cur = new_cur
+
+        return res
+
+class UsersByAgent(Resource):
+    def post(self):
+        if not SessionStorage.check_access(request.headers.get(SESSION_HEADER)):
+            return PERMISSIONS_DENIED
+
+        data = request.data
+        try:
+            data = json.loads(data)
+            agent_id = data['AgentId']
+        except:
+            return {'Message': 'Bad request data!', 'Status': 2}
+        session = Session()
+        query = session.execute("select FirstName, LastName, Email, PostCode, Balance, LimitGroupId, CountryCode, City, TimeZone, Currency from account with(nolock) where parrentid = {agent_id} and accountrole = 'User'".format(agent_id=agent_id))
+        users = query.fetchall()
+        resp = self._make_resp(query.keys(), users)
+        return {'Message': 'OK!', 'Status': 0, 'Results': resp}
+
+    def _make_resp(self, keys, rows):
+        res = []
+        for values in rows:
+            d = {}
+            for i, k in enumerate(keys):
+                d[k] = values[i]
+                if type(d[k]).__name__ == 'Decimal':
+                    d[k] = float(d[k])
+            res.append(d)
+        return res
+
+
+class DetailUser(Resource):
+    def post(self):
+        if not SessionStorage.check_access(request.headers.get(SESSION_HEADER)):
+            return PERMISSIONS_DENIED
+
+        data = request.data
+        try:
+            data = json.loads(data)
+            user_id = data['UserId']
+        except:
+            return {'Message': 'Bad request data!', 'Status': 2}
+
+        session = Session()
+        query = session.execute("select top(1) FirstName, LastName, Email, PostCode, Balance, LimitGroupId, CountryCode, City, TimeZone, Currency, AccountRole from account with(nolock) where id = {user_id}".format(user_id=user_id))
+        user = query.fetchone()
+        resp = self._make_one_response(query.keys(), user)
+        return {'Message': 'OK!', 'Status': 0, 'Results': resp}
+
+    def _make_one_response(self, keys, values):
+        res = {}
+        for i, k in enumerate(keys):
+            res[k] = values[i]
+            if type(res[k]).__name__ == 'Decimal':
+                res[k] = float(res[k])
+        return res
